@@ -1,22 +1,32 @@
 import os
-from fastapi import Header, HTTPException, Depends
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import time
-import requests
-import math
-import pandas as pd
-import uuid
-import os
 import json
-import paho.mqtt.client as mqtt
-API_KEY = os.getenv("PULSE15_API_KEY")
+import uuid
+import math
 
-def verify_api_key(x_api_key: str = Header(...)):
-    if API_KEY is None:
-        raise HTTPException(status_code=500, detail="API key not configured on server")
+import requests
+import pandas as pd
+import paho.mqtt.client as mqtt
+
+from typing import Optional
+from fastapi import FastAPI, Header, HTTPException, Depends
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# ========= API KEY =========
+API_KEY = os.getenv("PULSE15_API_KEY", "")  # se setea en Render
+
+def require_api_key(x_api_key: str = Header(default=None)):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: missing PULSE15_API_KEY")
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+# ========= MQTT (opcional) =========
+MQTT_HOST = os.getenv("MQTT_HOST", "")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_TOPIC_TICKET = os.getenv("MQTT_TOPIC_TICKET", "thalos/trading/order_ticket")
 
 
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
@@ -62,22 +72,48 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+BINANCE_KLINES_PRIMARY = "https://api.binance.com/api/v3/klines"
+BINANCE_KLINES_FALLBACK = "https://data-api.binance.vision/api/v3/klines"
+
 def fetch_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
     params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    r = requests.get(BINANCE_KLINES, params=params, timeout=10)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Binance error: {r.text}")
-    data = r.json()
-    if not isinstance(data, list) or len(data) < 200:
-        raise HTTPException(status_code=400, detail="Not enough kline data")
-    df = pd.DataFrame(data, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","qav","num_trades","tbbav","tbqav","ignore"
-    ])
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
-    df["open_time"] = df["open_time"].astype(int)
-    return df
+    urls = [BINANCE_KLINES_PRIMARY, BINANCE_KLINES_FALLBACK]
+
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(
+                url,
+                params=params,
+                timeout=12,
+                headers={"User-Agent": "pulse15-analyzer/1.0"}
+            )
+            if r.status_code != 200:
+                last_err = f"{url} -> {r.status_code}: {r.text[:200]}"
+                continue
+
+            data = r.json()
+            if not isinstance(data, list) or len(data) < 200:
+                last_err = f"{url} -> bad kline payload"
+                continue
+
+            df = pd.DataFrame(data, columns=[
+                "open_time","open","high","low","close","volume",
+                "close_time","qav","num_trades","tbbav","tbqav","ignore"
+            ])
+            for c in ["open","high","low","close","volume"]:
+                df[c] = df[c].astype(float)
+            df["open_time"] = df["open_time"].astype(int)
+            return df
+
+        except requests.RequestException as e:
+            last_err = f"{url} -> request_exception: {repr(e)}"
+            continue
+        except Exception as e:
+            last_err = f"{url} -> unexpected_exception: {repr(e)}"
+            continue
+
+    raise HTTPException(status_code=502, detail=f"Market data unavailable. {last_err}")
 
 def clamp(x, a, b):
     return max(a, min(b, x))
@@ -86,8 +122,8 @@ def clamp(x, a, b):
 def root():
     return {"status": "Pulse15 Analyzer running"}
 
-@app.post("/analyze")
-def analyze(request: SignalRequest):
+@app.post("/analyze", dependencies=[Depends(require_api_key)])
+def analyze(req: SignalRequest):
     result = analyze_signal(req)
     # opcional: meter request_id aquí para consistencia
     if req.request_id:
@@ -95,8 +131,8 @@ def analyze(request: SignalRequest):
     return result
 
 
-@app.post("/ticket")
-def create_ticket(request: TicketRequest, _: str = Depends(verify_api_key)):
+@app.post("/ticket", dependencies=[Depends(require_api_key)])
+def create_ticket(req: SignalRequest):
     analysis = analyze_signal(req)
 
     now = int(time.time())
@@ -126,8 +162,14 @@ def create_ticket(request: TicketRequest, _: str = Depends(verify_api_key)):
     return ticket
 
 
-@app.post("/ticket")
-def create_ticket(request: TicketRequest, _: str = Depends(verify_api_key)):
+@app.post("/publish_ticket", dependencies=[Depends(require_api_key)])
+def publish_ticket(req: SignalRequest):
+    if not MQTT_HOST:
+        raise HTTPException(
+            status_code=501,
+            detail="MQTT publishing is disabled on this deployment. Run locally with MQTT_HOST configured."
+        )
+
     ticket = create_ticket(req)
     payload = json.dumps(ticket, ensure_ascii=False)
 
@@ -146,7 +188,6 @@ def create_ticket(request: TicketRequest, _: str = Depends(verify_api_key)):
         "side": ticket["side"],
         "signal": ticket["signal"]
     }
-
 
 
 def analyze_signal(req: SignalRequest):
