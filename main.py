@@ -1,3 +1,5 @@
+import os
+from fastapi import Header, HTTPException, Depends
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import time
@@ -8,6 +10,14 @@ import uuid
 import os
 import json
 import paho.mqtt.client as mqtt
+API_KEY = os.getenv("PULSE15_API_KEY")
+
+def verify_api_key(x_api_key: str = Header(...)):
+    if API_KEY is None:
+        raise HTTPException(status_code=500, detail="API key not configured on server")
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
 
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -77,7 +87,7 @@ def root():
     return {"status": "Pulse15 Analyzer running"}
 
 @app.post("/analyze")
-def analyze(req: SignalRequest):
+def analyze(request: SignalRequest):
     result = analyze_signal(req)
     # opcional: meter request_id aquí para consistencia
     if req.request_id:
@@ -86,7 +96,7 @@ def analyze(req: SignalRequest):
 
 
 @app.post("/ticket")
-def create_ticket(req: SignalRequest):
+def create_ticket(request: TicketRequest, _: str = Depends(verify_api_key)):
     analysis = analyze_signal(req)
 
     now = int(time.time())
@@ -116,8 +126,8 @@ def create_ticket(req: SignalRequest):
     return ticket
 
 
-@app.post("/publish_ticket")
-def publish_ticket(req: SignalRequest):
+@app.post("/ticket")
+def create_ticket(request: TicketRequest, _: str = Depends(verify_api_key)):
     ticket = create_ticket(req)
     payload = json.dumps(ticket, ensure_ascii=False)
 
